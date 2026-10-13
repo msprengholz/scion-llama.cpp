@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <memory>
 #include <type_traits>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -417,6 +418,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         return ncols_dst <= MMVQ_MAX_BATCH_SIZE ? 4 : 1;
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+        if (small_k && halve_iters) {
+            // tiny-K decode MoE geometry: one warp per block
+            return 1;
+        }
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -552,12 +557,22 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
         return ptq1_0_pt_rows_per_block(ncols_dst);
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+        if (table_id == MMVQ_PARAMETERS_GENERIC && small_k && nwarps == 1 && ncols_dst == 1) {
+            // tiny-K decode MoE geometry: rows per block amortize the activation row reads
+            return 4;
+        }
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                if (small_k) {
+                    return nwarps;
+                }
+                // Several rows per block re-read the q8_1 activation row once per block instead
+                // of once per row. Measured on GP100/sm_60 (patch 02); sm_52 measured in round 6.
+                return table_id == MMVQ_PARAMETERS_GENERIC ? 4 : 1;
             case 2:
             case 3:
             case 4:
+                return table_id == MMVQ_PARAMETERS_GENERIC ? 4 : 2;
             case 5:
             case 6:
             case 7:
@@ -1345,7 +1360,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
-            if (should_use_small_k(c_ncols_dst)) {
+            // Decode MoE GEMVs on pre-Volta NVIDIA: 128-element blocks give K/128 K-blocks per
+            // row, so the generic 4-warp geometry leaves most of its 32 thread groups idle and
+            // re-reads the activation row per output row. One warp with 4 rows per block fills
+            // the K-block groups and amortizes the activation reads.
+            const int moe_blocks_per_row = int(ncols_x) / qk;
+            if (has_ids && table_id == MMVQ_PARAMETERS_GENERIC && moe_blocks_per_row <= 16 &&
+                    (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0)) {
+                launch(std::true_type{},  std::true_type{});
+            } else if (should_use_small_k(c_ncols_dst)) {
                 launch(std::true_type{},  std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
@@ -1664,23 +1687,56 @@ void ggml_cuda_mul_mat_vec_q(
         // Warp-transposed q8 layout needs whole 32-K-block groups per column.
         ne10_padded = GGML_PAD(ne10_padded, GGML_CUDA_PTQ1_K_PAD);
     }
-    // src1 may be a Hadamard transform output whose producer already wrote the q8_1 rows in this
-    // exact layout (ggml_cuda_fwht_q8, into src1's buffer or a held pool block); nothing to quantize.
+    // src1 may already be q8_1 in this exact layout: either a Hadamard transform wrote the rows
+    // (ggml_cuda_fwht_q8), or an earlier mat-vec quantized the same activation for this graph
+    // (ggml_cuda_act_q8). Nothing left to quantize.
     const ggml_cuda_fwht_q8 * pre_q8 = ids ? nullptr : ctx.fwht_q8().find(src1);
     if (pre_q8) {
         GGML_ASSERT(pre_q8->layout == y_layout && pre_q8->ne0 == ne10_padded && pre_q8->ncols == ne11 && ne12 == 1 && ne13 == 1);
     }
+
+    // One activation feeds many mat-vecs per layer (qwen35moe: the 2048-wide attention input is
+    // read by 9 projections), so quantizing per call re-does identical work. Registering the
+    // result for the rest of the graph removes ~35% of the quantize launches and ~28% of their
+    // kernel time, but on sm_52 it is NOT a throughput win: with CUDA graphs on, the removed
+    // launches cost almost nothing, and the pool bookkeeping costs slightly more than it saves
+    // (tg512 A/B, 5 interleaved rounds: 35.45/35.26/35.27 off vs 35.29/35.14/35.22 on).
+    // Default off; set GGML_CUDA_ACT_Q8_CACHE=1 to enable.
+    static const bool q8_act_cache_enabled = getenv("GGML_CUDA_ACT_Q8_CACHE") != nullptr &&
+                                             atoi(getenv("GGML_CUDA_ACT_Q8_CACHE")) != 0;
+    // src1->op is GGML_OP_NONE for the per-expert stack-local slices the MUL_MAT_ID fallback
+    // builds (ggml_cuda_mul_mat_id): their address repeats every expert with different rows, so
+    // they must never be cached. Real graph tensors always carry their producing op.
+    const bool cacheable = q8_act_cache_enabled && pre_q8 == nullptr && ids == nullptr &&
+                           src1->op != GGML_OP_NONE && ne12 == 1 && ne13 == 1;
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     const char * src1_q8_1_d = nullptr;
     if (pre_q8) {
         src1_q8_1_d = (const char *) pre_q8->data;
     } else {
-        src1_q8_1_d = src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+        const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), y_layout, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+        // Exactly one allocation on each path: the VMM pool frees strictly LIFO, so a cached
+        // block must not be allocated on top of a shorter-lived one.
+        if (cacheable) {
+            auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+            quantize_row_q8_1_cuda(src1_d, nullptr, blk->get(), y_layout, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            ggml_cuda_fwht_q8 e;
+            e.layout = y_layout;
+            e.ne0    = ne10_padded;
+            e.ncols  = ne11;
+            e.data   = blk->get();
+            ctx.fwht_q8().held.push_back(std::move(blk));
+            ctx.fwht_q8().set(src1, e);
+            src1_q8_1_d = (const char *) e.data;
+        } else {
+            src1_q8_1_d = src1_q8_1.alloc(q8_bytes);
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), y_layout, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
